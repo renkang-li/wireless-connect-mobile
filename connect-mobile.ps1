@@ -1,5 +1,5 @@
 param(
-    [string]$PhoneIp = "192.168.47.110",
+    [string]$PhoneIp = "192.168.47.241",
     [int]$Port = 5555
 )
 
@@ -43,6 +43,103 @@ function Save-LastIp {
     Set-Content -LiteralPath $StateFile -Value $Ip -Encoding utf8
 }
 
+function Convert-IPv4ToUInt32 {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Ip
+    )
+
+    try {
+        $bytes = [System.Net.IPAddress]::Parse($Ip).GetAddressBytes()
+        [array]::Reverse($bytes)
+        [BitConverter]::ToUInt32($bytes, 0)
+    }
+    catch {
+        $null
+    }
+}
+
+function Convert-UInt32ToIPv4 {
+    param(
+        [Parameter(Mandatory = $true)]
+        [uint32]$Value
+    )
+
+    $bytes = [BitConverter]::GetBytes($Value)
+    [array]::Reverse($bytes)
+    ([System.Net.IPAddress]::new($bytes)).ToString()
+}
+
+function Get-DefaultRouteInterfaceIndexes {
+    Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
+        Sort-Object RouteMetric, InterfaceMetric |
+        Select-Object -ExpandProperty InterfaceIndex -Unique
+}
+
+function Get-ThirdOctetSubnetsFromNetwork {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Ip,
+        [Parameter(Mandatory = $true)]
+        [int]$PrefixLength,
+        [int]$MaxSubnets = 16
+    )
+
+    $singleSubnet = Get-SubnetFromIp -Ip $Ip
+    if (-not $singleSubnet) {
+        return @()
+    }
+
+    if ($PrefixLength -ge 24) {
+        return @($singleSubnet)
+    }
+
+    if ($PrefixLength -lt 20 -or $PrefixLength -gt 30) {
+        return @($singleSubnet)
+    }
+
+    $ipValue = Convert-IPv4ToUInt32 -Ip $Ip
+    if ($null -eq $ipValue) {
+        return @($singleSubnet)
+    }
+
+    $hostBits = 32 - $PrefixLength
+    $hostMask = [uint32](([uint64]1 -shl $hostBits) - 1)
+    $network = [uint32]($ipValue -band [uint32](-bnot $hostMask))
+    $broadcast = [uint32]($network + $hostMask)
+    if ($broadcast -le ($network + 1)) {
+        return @($singleSubnet)
+    }
+
+    $startParts = (Convert-UInt32ToIPv4 -Value ([uint32]($network + 1))).Split('.')
+    $endParts = (Convert-UInt32ToIPv4 -Value ([uint32]($broadcast - 1))).Split('.')
+    if ($startParts.Count -ne 4 -or $endParts.Count -ne 4) {
+        return @($singleSubnet)
+    }
+
+    if ($startParts[0] -ne $endParts[0] -or $startParts[1] -ne $endParts[1]) {
+        return @($singleSubnet)
+    }
+
+    $startThird = [int]$startParts[2]
+    $endThird = [int]$endParts[2]
+    if ($endThird -lt $startThird) {
+        return @($singleSubnet)
+    }
+
+    $subnetCount = $endThird - $startThird + 1
+    if ($subnetCount -gt $MaxSubnets) {
+        return @($singleSubnet)
+    }
+
+    $results = New-Object 'System.Collections.Generic.List[string]'
+    for ($third = $startThird; $third -le $endThird; $third++) {
+        $results.Add(('{0}.{1}.{2}' -f $startParts[0], $startParts[1], $third)) | Out-Null
+    }
+
+    $results
+}
+
 function Add-CandidateIp {
     param(
         [System.Collections.Generic.List[string]]$List,
@@ -80,23 +177,23 @@ function Get-ConnectedTcpIps {
 function Get-ActiveSubnets {
     $subnets = New-Object 'System.Collections.Generic.List[string]'
     $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+    $defaultRouteIndexes = @(Get-DefaultRouteInterfaceIndexes)
 
     $addresses = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
         Where-Object {
             $_.IPAddress -notmatch '^169\.254\.' -and
             $_.IPAddress -notmatch '^127\.' -and
-            $_.PrefixLength -ge 24
+            (
+                $defaultRouteIndexes.Count -eq 0 -or
+                $defaultRouteIndexes -contains $_.InterfaceIndex
+            )
         }
 
     foreach ($item in $addresses) {
-        $parts = $item.IPAddress.Split('.')
-        if ($parts.Count -ne 4) {
-            continue
-        }
-
-        $subnet = '{0}.{1}.{2}' -f $parts[0], $parts[1], $parts[2]
-        if ($seen.Add($subnet)) {
-            $subnets.Add($subnet) | Out-Null
+        foreach ($subnet in (Get-ThirdOctetSubnetsFromNetwork -Ip $item.IPAddress -PrefixLength $item.PrefixLength)) {
+            if ($seen.Add($subnet)) {
+                $subnets.Add($subnet) | Out-Null
+            }
         }
     }
 
@@ -264,7 +361,10 @@ function Find-ReachablePhoneIp {
                 continue
             }
 
-            if (Test-TcpPort -Ip $ip -Port $Port) {
+            if (
+                (Test-TcpPort -Ip $ip -Port $Port) -and
+                (Try-AdbConnectTarget -AdbPath $AdbPath -Ip $ip -Port $Port)
+            ) {
                 return $ip
             }
         }
