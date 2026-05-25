@@ -174,6 +174,82 @@ function Get-ConnectedTcpIps {
     }
 }
 
+function Get-UsbDeviceSerials {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$AdbPath
+    )
+
+    $lines = & $AdbPath devices
+    foreach ($line in $lines) {
+        if ($line -match '^(?<serial>\S+)\s+device(?:\s|$)') {
+            $serial = $matches.serial
+            if (
+                $serial -notmatch '^\d{1,3}(?:\.\d{1,3}){3}:\d+$' -and
+                $serial -notmatch '^emulator-\d+$'
+            ) {
+                $serial
+            }
+        }
+    }
+}
+
+function Get-WifiIpFromUsbDevice {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$AdbPath,
+        [Parameter(Mandatory = $true)]
+        [string]$Serial
+    )
+
+    try {
+        $routeLines = & $AdbPath -s $Serial shell ip route 2>$null
+        foreach ($line in $routeLines) {
+            if ($line -match '\bdev\s+wlan0\b.*\bsrc\s+(?<ip>\d{1,3}(?:\.\d{1,3}){3})\b') {
+                return $matches.ip
+            }
+        }
+
+        $addrLines = & $AdbPath -s $Serial shell ip -f inet addr show wlan0 2>$null
+        foreach ($line in $addrLines) {
+            if ($line -match '\binet\s+(?<ip>\d{1,3}(?:\.\d{1,3}){3})/') {
+                return $matches.ip
+            }
+        }
+    }
+    catch {
+        return $null
+    }
+
+    return $null
+}
+
+function Try-UsbTcpipRecovery {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$AdbPath,
+        [Parameter(Mandatory = $true)]
+        [int]$Port
+    )
+
+    foreach ($serial in (Get-UsbDeviceSerials -AdbPath $AdbPath)) {
+        $ip = Get-WifiIpFromUsbDevice -AdbPath $AdbPath -Serial $serial
+        if (-not $ip) {
+            continue
+        }
+
+        Write-Host "检测到 USB 在线设备 $serial，当前手机 IP $ip，正在开启 adb tcpip $Port ..." -ForegroundColor DarkGray
+        & $AdbPath -s $serial tcpip $Port | Out-Null
+        Start-Sleep -Seconds 2
+
+        if (Try-AdbConnectTarget -AdbPath $AdbPath -Ip $ip -Port $Port) {
+            return $ip
+        }
+    }
+
+    return $null
+}
+
 function Get-ActiveSubnets {
     $subnets = New-Object 'System.Collections.Generic.List[string]'
     $seen = New-Object 'System.Collections.Generic.HashSet[string]'
@@ -338,6 +414,11 @@ function Find-ReachablePhoneIp {
         if (Try-AdbConnectTarget -AdbPath $AdbPath -Ip $ip -Port $Port) {
             return $ip
         }
+    }
+
+    $usbRecoveredIp = Try-UsbTcpipRecovery -AdbPath $AdbPath -Port $Port
+    if ($usbRecoveredIp) {
+        return $usbRecoveredIp
     }
 
     $subnets = @(Get-ActiveSubnets) + @(
