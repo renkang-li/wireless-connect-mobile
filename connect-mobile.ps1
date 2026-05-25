@@ -391,6 +391,7 @@ function Get-SubnetFromIp {
 function Find-ReachablePhoneIp {
     param(
         [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
         [string]$PreferredIp,
         [Parameter(Mandatory = $true)]
         [string]$AdbPath,
