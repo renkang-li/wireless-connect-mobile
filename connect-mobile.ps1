@@ -1,5 +1,5 @@
 param(
-    [string]$PhoneIp = "192.168.47.241",
+    [string]$PhoneIp = "",
     [int]$Port = 5555
 )
 
@@ -400,7 +400,7 @@ function Find-ReachablePhoneIp {
 
     $lastIp = Get-LastIp
     $connectedIps = @(Get-ConnectedTcpIps -AdbPath $AdbPath)
-    $knownIps = @($PreferredIp, $lastIp) + $connectedIps |
+    $knownIps = $connectedIps + @($lastIp, $PreferredIp) |
         Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' } |
         Select-Object -Unique
 
@@ -410,15 +410,15 @@ function Find-ReachablePhoneIp {
         }
     }
 
+    $usbRecoveredIp = Try-UsbTcpipRecovery -AdbPath $AdbPath -Port $Port
+    if ($usbRecoveredIp) {
+        return $usbRecoveredIp
+    }
+
     foreach ($ip in $knownIps) {
         if (Try-AdbConnectTarget -AdbPath $AdbPath -Ip $ip -Port $Port) {
             return $ip
         }
-    }
-
-    $usbRecoveredIp = Try-UsbTcpipRecovery -AdbPath $AdbPath -Port $Port
-    if ($usbRecoveredIp) {
-        return $usbRecoveredIp
     }
 
     $subnets = @(Get-ActiveSubnets) + @(
